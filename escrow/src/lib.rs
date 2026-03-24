@@ -259,7 +259,7 @@ impl EscrowContract {
 
         // --- Increment and persist escrow counter ---
         let mut count: u64 = env.storage().persistent().get(&ESCROW_COUNT).unwrap_or(0);
-        count += 1;
+        count = count.checked_add(1).expect("Counter overflow");
         env.storage().persistent().set(&ESCROW_COUNT, &count);
         env.storage()
             .persistent()
@@ -491,8 +491,14 @@ impl EscrowContract {
         // --- Calculate split amounts ---
         // mentor_amount = floor(amount * mentor_pct / 100)
         // learner_amount = amount - mentor_amount  (avoids any dust loss)
-        let mentor_amount: i128 = escrow.amount * (mentor_pct as i128) / 100;
-        let learner_amount: i128 = escrow.amount - mentor_amount;
+        let mentor_amount: i128 = escrow.amount
+            .checked_mul(mentor_pct as i128)
+            .expect("Overflow")
+            .checked_div(100)
+            .expect("Division error");
+        let learner_amount: i128 = escrow.amount
+            .checked_sub(mentor_amount)
+            .expect("Underflow");
 
         let token_client = token::Client::new(&env, &escrow.token_address);
 
@@ -656,8 +662,14 @@ impl EscrowContract {
             .persistent()
             .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
-        let platform_fee: i128 = escrow.amount * (fee_bps as i128) / 10_000;
-        let net_amount: i128 = escrow.amount - platform_fee;
+        let platform_fee: i128 = escrow.amount
+            .checked_mul(fee_bps as i128)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
+        let net_amount: i128 = escrow.amount
+            .checked_sub(platform_fee)
+            .expect("Underflow");
 
         let treasury: Address = env
             .storage()
@@ -716,6 +728,7 @@ impl EscrowContract {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
@@ -727,7 +740,7 @@ mod test {
     // Helpers
     // -----------------------------------------------------------------------
 
-    fn create_token(env: &Env, admin: &Address) -> (Address, StellarAssetClient) {
+    fn create_token<'a>(env: &'a Env, admin: &Address) -> (Address, StellarAssetClient<'a>) {
         let token_address = env
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
@@ -743,7 +756,6 @@ mod test {
         learner: Address,
         treasury: Address,
         token_address: Address,
-        token_sac: StellarAssetClient,
     }
 
     impl TestFixture {
@@ -758,6 +770,8 @@ mod test {
         fn setup_with_fee_and_delay(fee_bps: u32, auto_release_delay_secs: u64) -> Self {
             let env = Env::default();
             env.mock_all_auths();
+            // Advance time so timestamp is not 0
+            env.ledger().with_mut(|li| li.timestamp = 14400);
 
             let contract_id = env.register_contract(None, EscrowContract);
             let admin = Address::generate(&env);
@@ -787,7 +801,6 @@ mod test {
                 learner,
                 treasury,
                 token_address,
-                token_sac,
             }
         }
 
@@ -797,6 +810,10 @@ mod test {
 
         fn token(&self) -> TokenClient {
             TokenClient::new(&self.env, &self.token_address)
+        }
+
+        fn sac(&self) -> StellarAssetClient {
+            StellarAssetClient::new(&self.env, &self.token_address)
         }
 
         /// Helper: create an escrow with a given session_end_time.
@@ -1483,12 +1500,13 @@ mod test {
         // 1-hour delay; session ended in the past.
         let f = TestFixture::setup_with_fee_and_delay(500, 3_600);
         let token = f.token();
+        let now = f.env.ledger().timestamp();
 
-        let session_end: u64 = 1_000; // arbitrary past timestamp
+        let session_end: u64 = now.checked_sub(200).expect("Underflow");
         let id = f.create_escrow_at(session_end);
 
         // Wind clock past session_end + delay (1 h = 3 600 s).
-        advance_time(&f.env, session_end + 3_600 + 1);
+        advance_time(&f.env, 3_600 + 1);
 
         let mentor_before = token.balance(&f.mentor);
         let treasury_before = token.balance(&f.treasury);
@@ -1509,11 +1527,14 @@ mod test {
     #[test]
     fn test_auto_release_triggers_exactly_at_boundary() {
         let f = TestFixture::setup_with_fee_and_delay(0, 3_600);
-        let session_end: u64 = 500;
+        let now = f.env.ledger().timestamp();
+        let session_end: u64 = now.checked_sub(200).expect("Underflow");
         let id = f.create_escrow_at(session_end);
 
         // Advance to exactly session_end + delay (boundary is inclusive).
-        advance_time(&f.env, session_end + 3_600);
+        // session_end = now - 200.
+        // target = session_end + 3600 = now - 200 + 3600 = now + 3400.
+        advance_time(&f.env, 3_600 - 200);
 
         f.client().try_auto_release(&id); // must succeed
         assert_eq!(f.client().get_escrow(&id).status, EscrowStatus::Released);
@@ -1522,11 +1543,13 @@ mod test {
     #[test]
     fn test_auto_release_rejected_before_delay() {
         let f = TestFixture::setup_with_fee_and_delay(500, 3_600);
-        let session_end: u64 = 1_000;
+        let now = f.env.ledger().timestamp();
+        let session_end: u64 = now.checked_add(100).expect("Overflow");
         let id = f.create_escrow_at(session_end);
 
         // Advance to one second before the window opens.
-        advance_time(&f.env, session_end + 3_600 - 1);
+        // session_end + 3600 - 1 = now + 100 + 3600 - 1 = now + 3699.
+        advance_time(&f.env, 100 + 3_600 - 1);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f.client().try_auto_release(&id);
@@ -1538,9 +1561,10 @@ mod test {
     fn test_auto_release_permissionless_any_caller_can_trigger() {
         // try_auto_release requires no auth — anyone can call it.
         let f = TestFixture::setup_with_fee_and_delay(0, 3_600);
-        let session_end: u64 = 100;
+        let now = f.env.ledger().timestamp();
+        let session_end: u64 = now;
         let id = f.create_escrow_at(session_end);
-        advance_time(&f.env, session_end + 3_600 + 1);
+        advance_time(&f.env, 3_600 + 1);
 
         // Call with a completely unrelated address (no mock_all_auths needed
         // for the caller itself since try_auto_release does not require_auth).
@@ -1551,13 +1575,14 @@ mod test {
     #[test]
     fn test_auto_release_fails_if_already_released() {
         let f = TestFixture::setup_with_fee_and_delay(500, 3_600);
-        let session_end: u64 = 100;
+        let now = f.env.ledger().timestamp();
+        let session_end: u64 = now;
         let id = f.create_escrow_at(session_end);
-
+        
         // Manual release first.
         f.client().release_funds(&f.learner, &id);
 
-        advance_time(&f.env, session_end + 3_600 + 1);
+        advance_time(&f.env, 3_600 + 1);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f.client().try_auto_release(&id);
@@ -1572,12 +1597,13 @@ mod test {
     fn test_auto_release_fails_if_disputed() {
         // A disputed escrow should NOT auto-release — dispute blocks the timer.
         let f = TestFixture::setup_with_fee_and_delay(500, 3_600);
-        let session_end: u64 = 100;
+        let now = f.env.ledger().timestamp();
+        let session_end: u64 = now;
         let id = f.create_escrow_at(session_end);
-
+        
         f.client().dispute(&f.learner, &id, &symbol_short!("LATE"));
 
-        advance_time(&f.env, session_end + 3_600 + 1);
+        advance_time(&f.env, 3_600 + 1);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f.client().try_auto_release(&id);
@@ -1593,7 +1619,8 @@ mod test {
         // Passing 0 at init should store 72 hours; verify auto-release
         // triggers after exactly 72 h.
         let f = TestFixture::setup_with_fee_and_delay(0, 0); // 0 → default 72 h
-        let session_end: u64 = 0;
+        let now = f.env.ledger().timestamp();
+        let session_end: u64 = now;
         let id = f.create_escrow_at(session_end);
 
         let delay_72h: u64 = 72 * 60 * 60;
@@ -1609,5 +1636,52 @@ mod test {
         advance_time(&f.env, 1);
         f.client().try_auto_release(&id);
         assert_eq!(f.client().get_escrow(&id).status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_amount_max_i128_overflow_protection() {
+        let f = TestFixture::setup_with_fee(500); // 5% fee
+        // Use a large amount that doesn't overflow i128 itself but
+        // amount * fee_bps will overflow.
+        // i128::MAX is ~1.7e38. fee_bps is 500.
+        // amount = i128::MAX / 100 is ~1.7e36.
+        // amount * 500 = 8.5e38 > i128::MAX.
+        let amount = i128::MAX / 100;
+        
+        // Mint to learner
+        f.sac().mint(&f.learner, &amount);
+        
+        // Create escrow with max i128
+        let id = f.client().create_escrow(
+            &f.mentor,
+            &f.learner,
+            &amount,
+            &symbol_short!("MAX"),
+            &f.token_address,
+            &0u64,
+        );
+        
+        // Releasing should panic due to overflow in platform fee calculation
+        // (amount * 500 / 10000) -> i128::MAX * 500 will overflow before division
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f.client().release_funds(&f.learner, &id);
+        }));
+        assert!(result.is_err(), "Should panic on overflow during fee calculation");
+    }
+
+    #[test]
+    fn test_zero_amount_validation() {
+        let f = TestFixture::setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f.client().create_escrow(
+                &f.mentor,
+                &f.learner,
+                &0,
+                &symbol_short!("ZERO"),
+                &f.token_address,
+                &0u64,
+            );
+        }));
+        assert!(result.is_err(), "Should panic on zero amount");
     }
 }
