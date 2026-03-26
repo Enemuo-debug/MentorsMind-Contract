@@ -65,8 +65,25 @@ impl TestFixture {
 
     fn create_escrow_at(&self, amount: i128, session_end_time: u64, session_id: &str) -> u64 {
         self.client().create_escrow(
-            &self.mentor, &self.learner, &amount,
-            &Symbol::new(&self.env, session_id), &self.token_address, &session_end_time,
+            &self.mentor,
+            &self.learner,
+            &amount,
+            &Symbol::new(&self.env, session_id),
+            &self.token_address,
+            &session_end_time,
+            &1,
+        )
+    }
+
+    fn create_package_escrow_at(&self, amount: i128, session_end_time: u64, session_id: &str, total_sessions: u32) -> u64 {
+        self.client().create_escrow(
+            &self.mentor,
+            &self.learner,
+            &amount,
+            &Symbol::new(&self.env, session_id),
+            &self.token_address,
+            &session_end_time,
+            &total_sessions,
         )
     }
 
@@ -96,36 +113,82 @@ fn test_session_id_uniqueness() {
 #[test]
 fn test_release_partial() {
     let f = TestFixture::setup_with_fee(500); // 5% fee
-    let id = f.create_escrow_at(1_000, 0, "S1");
+    let id = f.create_package_escrow_at(1_200, 0, "S1", 3); // 3 sessions, 400 each
     
     let mentor_before = f.token().balance(&f.mentor);
     let treasury_before = f.token().balance(&f.treasury);
     
-    // Release 400
-    f.client().release_partial(&f.learner, &id, &400);
+    // Release 1st session (400)
+    f.client().release_partial(&f.learner, &id);
     
     // 400 * 0.05 = 20 fee, 380 net
     assert_eq!(f.token().balance(&f.mentor), mentor_before + 380);
     assert_eq!(f.token().balance(&f.treasury), treasury_before + 20);
     
     let e = f.client().get_escrow(&id);
-    assert_eq!(e.amount, 600);
+    assert_eq!(e.amount, 800);
+    assert_eq!(e.sessions_completed, 1);
     assert_eq!(e.status, EscrowStatus::Active);
-    assert_eq!(e.platform_fee, 20);
-    assert_eq!(e.net_amount, 380);
     
-    // Release remaining 600
-    f.client().release_partial(&f.learner, &id, &600);
-    
-    // 600 * 0.05 = 30 fee, 570 net. Total: 50 fee, 950 net.
-    assert_eq!(f.token().balance(&f.mentor), mentor_before + 950);
-    assert_eq!(f.token().balance(&f.treasury), treasury_before + 50);
+    // Release 2nd session (400)
+    f.client().release_partial(&f.learner, &id);
+    assert_eq!(f.token().balance(&f.mentor), mentor_before + 760);
+    assert_eq!(f.token().balance(&f.treasury), treasury_before + 40);
     
     let e2 = f.client().get_escrow(&id);
-    assert_eq!(e2.amount, 0);
-    assert_eq!(e2.status, EscrowStatus::Released);
-    assert_eq!(e2.platform_fee, 50);
-    assert_eq!(e2.net_amount, 950);
+    assert_eq!(e2.amount, 400);
+    assert_eq!(e2.sessions_completed, 2);
+    assert_eq!(e2.status, EscrowStatus::Active);
+
+    // Release 3rd session (remaining 400)
+    f.client().release_partial(&f.learner, &id);
+    assert_eq!(f.token().balance(&f.mentor), mentor_before + 1140);
+    assert_eq!(f.token().balance(&f.treasury), treasury_before + 60);
+    
+    let e3 = f.client().get_escrow(&id);
+    assert_eq!(e3.amount, 0);
+    assert_eq!(e3.sessions_completed, 3);
+    assert_eq!(e3.status, EscrowStatus::Released);
+}
+
+#[test]
+fn test_three_session_package_full_lifecycle() {
+    let f = TestFixture::setup_with_fee(1000); // 10% fee
+    let id = f.create_package_escrow_at(3000, 0, "PKG1", 3);
+    
+    // 1st release
+    f.client().release_partial(&f.learner, &id);
+    let e1 = f.client().get_escrow(&id);
+    assert_eq!(e1.amount, 2000);
+    assert_eq!(e1.sessions_completed, 1);
+    assert_eq!(f.token().balance(&f.mentor), 900); // 1000 - 100 fee
+    
+    // 2nd release
+    f.client().release_partial(&f.learner, &id);
+    let e2 = f.client().get_escrow(&id);
+    assert_eq!(e2.amount, 1000);
+    assert_eq!(e2.sessions_completed, 2);
+    assert_eq!(f.token().balance(&f.mentor), 1800);
+    
+    // 3rd release
+    f.client().release_partial(&f.learner, &id);
+    let e3 = f.client().get_escrow(&id);
+    assert_eq!(e3.amount, 0);
+    assert_eq!(e3.sessions_completed, 3);
+    assert_eq!(e3.status, EscrowStatus::Released);
+    assert_eq!(f.token().balance(&f.mentor), 2700);
+    assert_eq!(f.token().balance(&f.treasury), 300);
+}
+
+#[test]
+#[should_panic(expected = "Escrow not active")]
+fn test_over_release_panics() {
+    let f = TestFixture::setup();
+    let id = f.create_package_escrow_at(1000, 0, "S1", 1);
+    
+    f.client().release_partial(&f.learner, &id);
+    // Should panic
+    f.client().release_partial(&f.learner, &id);
 }
 
 #[test]
