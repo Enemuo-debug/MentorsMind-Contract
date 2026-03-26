@@ -1,10 +1,10 @@
 #![cfg(test)]
 
-use mentorminds_escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
+use mentorminds_escrow::{EscrowContract, EscrowContractClient, EscrowStatus, MilestoneSpec, MilestoneStatus, MilestoneEscrow};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, Vec, symbol_short, Symbol,
+    Address, Env, Vec, symbol_short, Symbol, BytesN,
 };
 
 // -----------------------------------------------------------------------

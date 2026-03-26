@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec, IntoVal};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec, IntoVal, BytesN};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9,6 +9,37 @@ pub enum EscrowStatus {
     Disputed,
     Refunded,
     Resolved,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MilestoneStatus {
+    Pending,
+    Completed,
+    Disputed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MilestoneSpec {
+    pub description_hash: BytesN<32>,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MilestoneEscrow {
+    pub id: u64,
+    pub mentor: Address,
+    pub learner: Address,
+    pub total_amount: i128,
+    pub milestones: Vec<MilestoneSpec>,
+    pub milestone_statuses: Vec<MilestoneStatus>,
+    pub status: EscrowStatus,
+    pub created_at: u64,
+    pub token_address: Address,
+    pub platform_fee: i128,
+    pub net_amount: i128,
 }
 
 #[contracttype]
@@ -56,6 +87,7 @@ pub struct EscrowLegacy {
 }
 
 const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
+const MILESTONE_ESCROW_COUNT: Symbol = symbol_short!("MESC_CNT");
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const TREASURY: Symbol = symbol_short!("TREASURY");
 const FEE_BPS: Symbol = symbol_short!("FEE_BPS");
@@ -111,6 +143,11 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .extend_ttl(&ESCROW_COUNT, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        env.storage().persistent().set(&MILESTONE_ESCROW_COUNT, &0u64);
+        env.storage()
+            .persistent()
+            .extend_ttl(&MILESTONE_ESCROW_COUNT, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
         // Store configurable auto-release delay; fall back to 72 hours if 0.
         let delay = if auto_release_delay_secs == 0 {
@@ -819,5 +856,202 @@ impl EscrowContract {
         let admin: Address = env.storage().persistent().get(&ADMIN).expect("Not initialized");
         env.storage().persistent().extend_ttl(&ADMIN, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
         admin
+    }
+
+    pub fn create_milestone_escrow(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+        milestones: Vec<MilestoneSpec>,
+        token_address: Address,
+    ) -> u64 {
+        if milestones.is_empty() {
+            panic!("At least one milestone required");
+        }
+        
+        if !Self::_is_token_approved(&env, &token_address) {
+            panic!("Token not approved");
+        }
+        
+        let total_amount = milestones.iter().fold(0i128, |acc, m| acc.checked_add(m.amount).expect("Amount overflow"));
+        
+        if total_amount <= 0 {
+            panic!("Total amount must be greater than zero");
+        }
+        
+        learner.require_auth();
+        
+        let token_client = token::Client::new(&env, &token_address);
+        if token_client.balance(&learner) < total_amount {
+            panic!("Insufficient token balance");
+        }
+        
+        let mut count: u64 = env.storage().persistent().get(&MILESTONE_ESCROW_COUNT).unwrap_or(0);
+        count += 1;
+        env.storage().persistent().set(&MILESTONE_ESCROW_COUNT, &count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&MILESTONE_ESCROW_COUNT, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        token_client.transfer(&learner, &env.current_contract_address(), &total_amount);
+        
+        let milestone_statuses: Vec<MilestoneStatus> = (0..milestones.len())
+            .map(|_| MilestoneStatus::Pending)
+            .collect();
+        
+        let milestone_escrow = MilestoneEscrow {
+            id: count,
+            mentor: mentor.clone(),
+            learner: learner.clone(),
+            total_amount,
+            milestones: milestones.clone(),
+            milestone_statuses,
+            status: EscrowStatus::Active,
+            created_at: env.ledger().timestamp(),
+            token_address: token_address.clone(),
+            platform_fee: 0,
+            net_amount: 0,
+        };
+        
+        let key = (symbol_short!("MESCROW"), count);
+        env.storage().persistent().set(&key, &milestone_escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        env.events().publish(
+            (symbol_short!("milestone_created"), count),
+            (mentor, learner, total_amount, milestones.len())
+        );
+        
+        count
+    }
+    
+    pub fn complete_milestone(env: Env, escrow_id: u64, milestone_index: u32) {
+        let key = (symbol_short!("MESCROW"), escrow_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        let mut milestone_escrow: MilestoneEscrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Milestone escrow not found");
+        
+        if milestone_escrow.status != EscrowStatus::Active {
+            panic!("Milestone escrow not active");
+        }
+        
+        if milestone_index as usize >= milestone_escrow.milestones.len() {
+            panic!("Invalid milestone index");
+        }
+        
+        let current_status = milestone_escrow.milestone_statuses.get(milestone_index as usize).unwrap();
+        if *current_status != MilestoneStatus::Pending {
+            panic!("Milestone not pending");
+        }
+        
+        milestone_escrow.learner.require_auth();
+        
+        let milestone = &milestone_escrow.milestones[milestone_index as usize];
+        let fee_bps: u32 = env.storage().persistent().get(&FEE_BPS).unwrap_or(0u32);
+        env.storage()
+            .persistent()
+            .extend_ttl(&FEE_BPS, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        let platform_fee: i128 = milestone
+            .amount
+            .checked_mul(fee_bps as i128)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
+        let net_amount: i128 = milestone.amount.checked_sub(platform_fee).expect("Underflow");
+        
+        let treasury: Address = env.storage().persistent().get(&TREASURY).expect("Treasury not found");
+        env.storage()
+            .persistent()
+            .extend_ttl(&TREASURY, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        let token_client = token::Client::new(&env, &milestone_escrow.token_address);
+        
+        if platform_fee > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury, &platform_fee);
+        }
+        
+        token_client.transfer(&env.current_contract_address(), &milestone_escrow.mentor, &net_amount);
+        
+        milestone_escrow.milestone_statuses[milestone_index as usize] = MilestoneStatus::Completed;
+        milestone_escrow.platform_fee = milestone_escrow.platform_fee.checked_add(platform_fee).expect("Overflow");
+        milestone_escrow.net_amount = milestone_escrow.net_amount.checked_add(net_amount).expect("Overflow");
+        
+        let all_completed = milestone_escrow.milestone_statuses.iter().all(|s| *s == MilestoneStatus::Completed);
+        if all_completed {
+            milestone_escrow.status = EscrowStatus::Released;
+        }
+        
+        env.storage().persistent().set(&key, &milestone_escrow);
+        
+        env.events().publish(
+            (symbol_short!("milestone_completed"), escrow_id),
+            (milestone_index, milestone.amount, net_amount)
+        );
+    }
+    
+    pub fn dispute_milestone(env: Env, escrow_id: u64, milestone_index: u32, reason: Symbol) {
+        let key = (symbol_short!("MESCROW"), escrow_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        let mut milestone_escrow: MilestoneEscrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Milestone escrow not found");
+        
+        if milestone_escrow.status != EscrowStatus::Active {
+            panic!("Milestone escrow not active");
+        }
+        
+        if milestone_index as usize >= milestone_escrow.milestones.len() {
+            panic!("Invalid milestone index");
+        }
+        
+        let current_status = milestone_escrow.milestone_statuses.get(milestone_index as usize).unwrap();
+        if *current_status != MilestoneStatus::Pending {
+            panic!("Milestone not pending");
+        }
+        
+        milestone_escrow.mentor.require_auth();
+        milestone_escrow.learner.require_auth();
+        
+        milestone_escrow.milestone_statuses[milestone_index as usize] = MilestoneStatus::Disputed;
+        milestone_escrow.status = EscrowStatus::Disputed;
+        
+        env.storage().persistent().set(&key, &milestone_escrow);
+        
+        env.events().publish(
+            (symbol_short!("milestone_disputed"), escrow_id),
+            (milestone_index, reason)
+        );
+    }
+    
+    pub fn get_milestone_escrow(env: Env, escrow_id: u64) -> MilestoneEscrow {
+        let key = (symbol_short!("MESCROW"), escrow_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .expect("Milestone escrow not found")
+    }
+    
+    pub fn get_milestone_escrow_count(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .extend_ttl(&MILESTONE_ESCROW_COUNT, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        env.storage().persistent().get(&MILESTONE_ESCROW_COUNT).unwrap_or(0)
     }
 }
